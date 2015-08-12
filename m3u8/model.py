@@ -5,7 +5,6 @@
 
 from collections import namedtuple
 import os
-import posixpath
 import errno
 import math
 
@@ -105,6 +104,10 @@ class M3U8(object):
         Returns true if EXT-X-I-FRAMES-ONLY tag present in M3U8.
         http://tools.ietf.org/html/draft-pantos-http-live-streaming-07#section-3.3.12
 
+      `is_independent_segments`
+        Returns true if EXT-X-INDEPENDENT-SEGMENTS tag present in M3U8.
+        https://tools.ietf.org/html/draft-pantos-http-live-streaming-13#section-3.4.16
+
     '''
 
     simple_attributes = (
@@ -115,17 +118,22 @@ class M3U8(object):
         ('target_duration',  'targetduration'),
         ('media_sequence',   'media_sequence'),
         ('program_date_time',   'program_date_time'),
+        ('is_independent_segments', 'is_independent_segments'),
         ('version',          'version'),
         ('allow_cache',      'allow_cache'),
         ('playlist_type',    'playlist_type')
         )
 
-    def __init__(self, content=None, base_path=None, base_uri=None):
+    def __init__(self, content=None, base_path=None, base_uri=None, strict=False):
         if content is not None:
-            self.data = parser.parse(content)
+            self.data = parser.parse(content, strict)
         else:
             self.data = {}
         self._base_uri = base_uri
+        if self._base_uri:
+            if not self._base_uri.endswith('/'):
+                self._base_uri += '/'
+
         self._initialize_attributes()
         self.base_path = base_path
 
@@ -212,6 +220,8 @@ class M3U8(object):
         You could also use unicode(<this obj>) or str(<this obj>)
         '''
         output = ['#EXTM3U']
+        if self.is_independent_segments:
+            output.append('#EXT-X-INDEPENDENT-SEGMENTS')
         if self.media_sequence > 0:
             output.append('#EXT-X-MEDIA-SEQUENCE:' + str(self.media_sequence))
         if self.allow_cache:
@@ -352,7 +362,8 @@ class Segment(BasePathMixin):
 
         if self.discontinuity:
             output.append('#EXT-X-DISCONTINUITY\n')
-            output.append('#EXT-X-PROGRAM-DATE-TIME:%s\n' % parser.format_date_time(self.program_date_time))
+            if self.program_date_time:
+                output.append('#EXT-X-PROGRAM-DATE-TIME:%s\n' % parser.format_date_time(self.program_date_time))
         if self.cue_out:
             output.append('#EXT-X-CUE-OUT-CONT\n')
         output.append('#EXTINF:%s,' % int_or_float_to_string(self.duration))
@@ -445,7 +456,8 @@ class Playlist(BasePathMixin):
     Attributes:
 
     `stream_info` is a named tuple containing the attributes: `program_id`,
-    `bandwidth`,`resolution`, `codecs` and `resolution` which is a a tuple (w, h) of integers
+    `bandwidth`, `average_bandwidth`, `resolution`, `codecs` and `resolution`
+    which is a a tuple (w, h) of integers
 
     `media` is a list of related Media entries.
 
@@ -462,10 +474,13 @@ class Playlist(BasePathMixin):
         else:
             resolution_pair = None
 
-        self.stream_info = StreamInfo(bandwidth=stream_info['bandwidth'],
-                                      program_id=stream_info.get('program_id'),
-                                      resolution=resolution_pair,
-                                      codecs=stream_info.get('codecs'))
+        self.stream_info = StreamInfo(
+            bandwidth=stream_info['bandwidth'],
+            average_bandwidth=stream_info.get('average_bandwidth'),
+            program_id=stream_info.get('program_id'),
+            resolution=resolution_pair,
+            codecs=stream_info.get('codecs')
+        )
         self.media = []
         for media_type in ('audio', 'video', 'subtitles'):
             group_id = stream_info.get(media_type)
@@ -480,6 +495,9 @@ class Playlist(BasePathMixin):
             stream_inf.append('PROGRAM-ID=%d' % self.stream_info.program_id)
         if self.stream_info.bandwidth:
             stream_inf.append('BANDWIDTH=%d' % self.stream_info.bandwidth)
+        if self.stream_info.average_bandwidth:
+            stream_inf.append('AVERAGE-BANDWIDTH=%d' %
+                              self.stream_info.average_bandwidth)
         if self.stream_info.resolution:
             res = str(self.stream_info.resolution[0]) + 'x' + str(self.stream_info.resolution[1])
             stream_inf.append('RESOLUTION=' + res)
@@ -518,6 +536,7 @@ class IFramePlaylist(BasePathMixin):
 
         self.iframe_stream_info = StreamInfo(
             bandwidth=iframe_stream_info.get('bandwidth'),
+            average_bandwidth=None,
             program_id=iframe_stream_info.get('program_id'),
             resolution=resolution_pair,
             codecs=iframe_stream_info.get('codecs')
@@ -543,7 +562,10 @@ class IFramePlaylist(BasePathMixin):
 
         return '#EXT-X-I-FRAME-STREAM-INF:' + ','.join(iframe_stream_inf)
 
-StreamInfo = namedtuple('StreamInfo', ['bandwidth', 'program_id', 'resolution', 'codecs'])
+StreamInfo = namedtuple(
+    'StreamInfo',
+    ['bandwidth', 'average_bandwidth', 'program_id', 'resolution', 'codecs']
+)
 
 class Media(BasePathMixin):
     '''
@@ -572,7 +594,7 @@ class Media(BasePathMixin):
     def __init__(self, uri=None, type=None, group_id=None, language=None,
                  name=None, default=None, autoselect=None, forced=None,
                  characteristics=None, assoc_language=None,
-                 instream_id=None,base_uri=None):
+                 instream_id=None,base_uri=None, **extras):
         self.base_uri = base_uri
         self.uri = uri
         self.type = type
@@ -585,6 +607,7 @@ class Media(BasePathMixin):
         self.assoc_language = assoc_language
         self.instream_id = instream_id
         self.characteristics = characteristics
+        self.extras = extras
 
     def dumps(self):
         media_out = []
@@ -642,10 +665,7 @@ def quoted(string):
 
 def _urijoin(base_uri, path):
     if parser.is_url(base_uri):
-        parsed_url = url_parser.urlparse(base_uri)
-        prefix = parsed_url.scheme + '://' + parsed_url.netloc
-        new_path = posixpath.normpath(parsed_url.path + '/' + path)
-        return url_parser.urljoin(prefix, new_path.strip('/'))
+        return url_parser.urljoin(base_uri, path)
     else:
         return os.path.normpath(os.path.join(base_uri, path.strip('/')))
 
